@@ -125,12 +125,14 @@ static void remcons_vt_putchar(void *, char32_t);
 static void remcons_vt_cputs(void *, const char *);
 static void remcons_vt_flush(void *);
 static void remcons_vt_key(void *, keymod_t, keycode_t, char);
+static void remcons_vt_pos_event(void *, pos_event_t *);
 
 static vt100_cb_t remcons_vt_cb = {
 	.putuchar = remcons_vt_putchar,
 	.control_puts = remcons_vt_cputs,
 	.flush = remcons_vt_flush,
-	.key = remcons_vt_key
+	.key = remcons_vt_key,
+	.pos_event = remcons_vt_pos_event
 };
 
 static void remcons_new_conn(tcp_listener_t *lst, tcp_conn_t *conn);
@@ -372,6 +374,26 @@ static remcons_event_t *new_kbd_event(kbd_event_type_t type, keymod_t mods,
 	return event;
 }
 
+/** Creates new position event.
+ *
+ * @param ev Position event.
+ * @param c Pressed character.
+ */
+static remcons_event_t *new_pos_event(pos_event_t *ev)
+{
+	remcons_event_t *event = malloc(sizeof(remcons_event_t));
+	if (event == NULL) {
+		fprintf(stderr, "Out of memory.\n");
+		return NULL;
+	}
+
+	link_initialize(&event->link);
+	event->cev.type = CEV_POS;
+	event->cev.ev.pos = *ev;
+
+	return event;
+}
+
 /** Creates new console resize event.
  */
 static remcons_event_t *new_resize_event(void)
@@ -539,17 +561,17 @@ static errno_t spawn_task_fibril(void *arg)
 		telnet_user_error(user, "Spawning `%s %s /loc --msg -- %s' "
 		    "failed: %s.", APP_GETTERM, user->service_name, APP_SHELL,
 		    str_error(rc));
-		fibril_mutex_lock(&user->guard);
+		fibril_mutex_lock(&user->recv_lock);
 		user->task_finished = true;
 		user->srvs.aborted = true;
 		fibril_condvar_signal(&user->refcount_cv);
-		fibril_mutex_unlock(&user->guard);
+		fibril_mutex_unlock(&user->recv_lock);
 		return EOK;
 	}
 
-	fibril_mutex_lock(&user->guard);
+	fibril_mutex_lock(&user->recv_lock);
 	user->task_id = task;
-	fibril_mutex_unlock(&user->guard);
+	fibril_mutex_unlock(&user->recv_lock);
 
 	task_exit_t task_exit;
 	int task_retval;
@@ -559,11 +581,11 @@ static errno_t spawn_task_fibril(void *arg)
 	    task_retval);
 
 	/* Announce destruction. */
-	fibril_mutex_lock(&user->guard);
+	fibril_mutex_lock(&user->recv_lock);
 	user->task_finished = true;
 	user->srvs.aborted = true;
 	fibril_condvar_signal(&user->refcount_cv);
-	fibril_mutex_unlock(&user->guard);
+	fibril_mutex_unlock(&user->recv_lock);
 
 	return EOK;
 }
@@ -624,6 +646,17 @@ static void remcons_vt_key(void *arg, keymod_t mods, keycode_t key, char c)
 
 	list_append(&down->link, &remcons->in_events);
 	list_append(&up->link, &remcons->in_events);
+}
+
+static void remcons_vt_pos_event(void *arg, pos_event_t *ev)
+{
+	remcons_t *remcons = (remcons_t *)arg;
+
+	remcons_event_t *cev = new_pos_event(ev);
+	if (cev == NULL)
+		return;
+
+	list_append(&cev->link, &remcons->in_events);
 }
 
 /** Window size update callback.
@@ -699,6 +732,7 @@ static void remcons_new_conn(tcp_listener_t *lst, tcp_conn_t *conn)
 		vt100_set_sgr(remcons->vt, attrs);
 		vt100_cls(remcons->vt);
 		vt100_set_pos(remcons->vt, 0, 0);
+		vt100_set_button_reporting(remcons->vt, true);
 	}
 
 	con_srvs_init(&user->srvs);
@@ -727,7 +761,7 @@ static void remcons_new_conn(tcp_listener_t *lst, tcp_conn_t *conn)
 	fibril_add_ready(spawn_fibril);
 
 	/* Wait for all clients to exit. */
-	fibril_mutex_lock(&user->guard);
+	fibril_mutex_lock(&user->recv_lock);
 	while (!user_can_be_destroyed_no_lock(user)) {
 		if (user->task_finished) {
 			user->conn = NULL;
@@ -739,9 +773,9 @@ static void remcons_new_conn(tcp_listener_t *lst, tcp_conn_t *conn)
 				task_kill(user->task_id);
 			}
 		}
-		fibril_condvar_wait_timeout(&user->refcount_cv, &user->guard, 1000);
+		fibril_condvar_wait_timeout(&user->refcount_cv, &user->recv_lock, 1000);
 	}
-	fibril_mutex_unlock(&user->guard);
+	fibril_mutex_unlock(&user->recv_lock);
 
 	rc = loc_service_unregister(remcons_srv, user->service_id);
 	if (rc != EOK) {
